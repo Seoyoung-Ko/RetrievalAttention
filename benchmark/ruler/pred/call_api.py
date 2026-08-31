@@ -169,6 +169,7 @@ def get_pred(
         attn_type,
         retrieval_budget=retrieval_budget,
         estimation_budget=estimation_budget,
+        cache_ratio=args.cache_ratio, # syko modified
     )
 
     out = llm.generate(

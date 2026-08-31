@@ -22,7 +22,10 @@ fi
 # Root Directories
 ROOT_DIR="./ruler_eval_result" # the path that stores generated task samples and model predictions.
 
-NUM_SAMPLES=200
+# syko modified
+NUM_SAMPLES=${NUM_SAMPLES:-200}
+CACHE_RATIO=${CACHE_RATIO:-0.05}
+# syko end
 MAX_SEQ_LENGTH=${4}
 ATTN_TYPE=${3}
 DEVICE=auto
@@ -87,7 +90,8 @@ python -u pred/call_api.py \
     --retrieval_budget ${BUDGET_RATIO} \
     --estimation_budget ${ESTIMATE_RATIO} \
     --synthetic_len ${MAX_SEQ_LENGTH} \
-    --prefill_method ${PREFILL_METHOD}
+    --prefill_method ${PREFILL_METHOD} \
+    --cache_ratio ${CACHE_RATIO} # syko modified
 
 python -u eval/evaluate.py \
     --data_dir ${PRED_DIR} \

@@ -410,3 +410,13 @@ benchmark/reasoning/outputs
 
 !benchmark/reasoning/data/**/*.jsonl
 !asserts/*.png
+
+
+# syko
+analysis/
+experiment_inputs/
+kill_test_config.json
+profiles/
+run_mode_map.sh
+traces/
+trace.py

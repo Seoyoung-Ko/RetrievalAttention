@@ -72,32 +72,120 @@ class LLM:
         return hidden_states
 
 
-    def layer_decode(self, layer_idx, hidden_states):
-        # print(f'Layer = {layer_idx}')
+    # def layer_decode(self, layer_idx, hidden_states):
+    #     # print(f'Layer = {layer_idx}')
 
+    #     residual = hidden_states
+    #     bsz, seq_len, dim = hidden_states.shape
+    #     # assert seq_len == 1, f"Error: seq_len should be 1 for decoding, but got {seq_len}."
+    #     layer = self.layers[layer_idx]
+
+    #     hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
+        
+    #     query_states, key_states, value_states = self.wqkv(hidden_states, layer)
+    #     query_states, key_states = self.position_embedd(query_states, key_states)
+
+    #     query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)
+    #     key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+    #     value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+
+    #     key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
+    #     attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx)
+    #     hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
+    #     hidden_states = residual + hidden_states
+
+    #     residual = hidden_states
+    #     hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
+    #     hidden_states = self.mlp(hidden_states, layer)
+    #     hidden_states = residual + hidden_states
+
+    #     return hidden_states
+
+    def layer_decode(self, layer_idx, hidden_states):
         residual = hidden_states
         bsz, seq_len, dim = hidden_states.shape
-        # assert seq_len == 1, f"Error: seq_len should be 1 for decoding, but got {seq_len}."
         layer = self.layers[layer_idx]
 
-        hidden_states = self.layernorm(hidden_states, layer.input_layernorm_variance_epsilon, layer.input_layernorm_weight)
-        
-        query_states, key_states, value_states = self.wqkv(hidden_states, layer)
-        query_states, key_states = self.position_embedd(query_states, key_states)
+        # Input RMSNorm, QKV projection, RoPE
+        with torch.cuda.nvtx.range("stage/qkv_projection"):
+            hidden_states = self.layernorm(
+                hidden_states,
+                layer.input_layernorm_variance_epsilon,
+                layer.input_layernorm_weight,
+            )
 
-        query_states = query_states.view(bsz, seq_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+            query_states, key_states, value_states = self.wqkv(
+                hidden_states,
+                layer,
+            )
 
-        key_states, value_states = self.kv_cache.decode_update_kv_cache(key_states, value_states, layer_idx)
-        attn_out = self.decode_attention(query_states, key_states, value_states, layer_idx)
-        hidden_states = self.wo(attn_out, layer, bsz, seq_len, dim)
-        hidden_states = residual + hidden_states
+            query_states, key_states = self.position_embedd(
+                query_states,
+                key_states,
+            )
 
-        residual = hidden_states
-        hidden_states = self.layernorm(hidden_states, layer.post_attention_layernorm_variance_epsilon, layer.post_attention_layernorm_weight)
-        hidden_states = self.mlp(hidden_states, layer)
-        hidden_states = residual + hidden_states
+            query_states = query_states.view(
+                bsz,
+                seq_len,
+                self.num_heads,
+                self.head_dim,
+            )
+            key_states = key_states.view(
+                bsz,
+                seq_len,
+                self.num_key_value_heads,
+                self.head_dim,
+            )
+            value_states = value_states.view(
+                bsz,
+                seq_len,
+                self.num_key_value_heads,
+                self.head_dim,
+            )
+
+        # Append current token's K/V to KV cache
+        with torch.cuda.nvtx.range("stage/kv_cache_update"):
+            key_states, value_states = self.kv_cache.decode_update_kv_cache(
+                key_states,
+                value_states,
+                layer_idx,
+            )
+
+        # RetroInfer sparse attention
+        #
+        # Wave selection, selected-ID D2H, CPU mapping,
+        # execution gather, precise attention 등이 현재는 모두 이 안에 포함됩니다.
+        with torch.cuda.nvtx.range("stage/decode_attention"):
+            attn_out = self.decode_attention(
+                query_states,
+                key_states,
+                value_states,
+                layer_idx,
+            )
+
+        # Attention output projection and residual connection
+        with torch.cuda.nvtx.range("stage/attention_output"):
+            hidden_states = self.wo(
+                attn_out,
+                layer,
+                bsz,
+                seq_len,
+                dim,
+            )
+            hidden_states = residual + hidden_states
+
+        # Post-attention norm and FFN
+        with torch.cuda.nvtx.range("stage/mlp"):
+            residual = hidden_states
+
+            hidden_states = self.layernorm(
+                hidden_states,
+                layer.post_attention_layernorm_variance_epsilon,
+                layer.post_attention_layernorm_weight,
+            )
+
+            hidden_states = self.mlp(hidden_states, layer)
+            hidden_states = residual + hidden_states
 
         return hidden_states
 
@@ -127,21 +215,68 @@ class LLM:
         return logits
         
 
+    # def decode_forward(self, inputs_ids):
+    #     hidden_states = self.word_embedding(inputs_ids)
+
+    #     if self.num_gpus > 1:
+    #         for ldx in range(self.num_layers):
+    #             hidden_states = self.layer_decode(ldx, hidden_states)
+    #             hidden_states = self.parameter_move(hidden_states, ldx)
+    #         hidden_states = hidden_states.to(self.layers[0].device)
+    #     else:
+    #         for ldx in range(self.num_layers):
+    #             hidden_states = self.layer_decode(ldx, hidden_states)
+        
+    #     hidden_states = self.layernorm(hidden_states, self.norm_variance_epsilon, self.norm_weight)
+    #     logits = self.lm(hidden_states)
+        
+    #     return logits
+
     def decode_forward(self, inputs_ids):
-        hidden_states = self.word_embedding(inputs_ids)
+        with torch.cuda.nvtx.range("stage/token_embedding"):
+            hidden_states = self.word_embedding(inputs_ids)
 
         if self.num_gpus > 1:
             for ldx in range(self.num_layers):
-                hidden_states = self.layer_decode(ldx, hidden_states)
-                hidden_states = self.parameter_move(hidden_states, ldx)
-            hidden_states = hidden_states.to(self.layers[0].device)
+
+                # layer 번호를 나타내는 outer range
+                with torch.cuda.nvtx.range(f"layer_{ldx:02d}"):
+                    hidden_states = self.layer_decode(
+                        ldx,
+                        hidden_states,
+                    )
+
+                    with torch.cuda.nvtx.range("stage/parameter_move"):
+                        hidden_states = self.parameter_move(
+                            hidden_states,
+                            ldx,
+                        )
+
+            with torch.cuda.nvtx.range("stage/final_device_move"):
+                hidden_states = hidden_states.to(
+                    self.layers[0].device,
+                )
+
         else:
             for ldx in range(self.num_layers):
-                hidden_states = self.layer_decode(ldx, hidden_states)
-        
-        hidden_states = self.layernorm(hidden_states, self.norm_variance_epsilon, self.norm_weight)
-        logits = self.lm(hidden_states)
-        
+
+                # 예: layer_00, layer_01, ..., layer_31
+                with torch.cuda.nvtx.range(f"layer_{ldx:02d}"):
+                    hidden_states = self.layer_decode(
+                        ldx,
+                        hidden_states,
+                    )
+
+        with torch.cuda.nvtx.range("stage/final_norm"):
+            hidden_states = self.layernorm(
+                hidden_states,
+                self.norm_variance_epsilon,
+                self.norm_weight,
+            )
+
+        with torch.cuda.nvtx.range("stage/lm_head"):
+            logits = self.lm(hidden_states)
+
         return logits
 
 
@@ -189,21 +324,141 @@ class LLM:
             token_id_dtype = torch.int64 if not do_sample else torch.int32  # flashinfer returns int32
             eos_token = torch.empty((self.batch_size, 1), dtype=token_id_dtype, device=inputs_ids.device).fill_(self.tokenizer.eos_token_id)
         
+        # # Decoding
+        # print("Start decoding ...")
+
+        # # syko start
+        # # Nsight Systems profiling configuration
+        # profile_warmup = 5   # 먼저 실행하고 버릴 decode iteration 수
+        # profile_steps = 2    # 실제 capture할 decode iteration 수
+        # profile_started = False
+        # profile_stopped = False
+
+        # # 전체 decode latency 측정 시작 전에 앞선 CUDA 작업 완료
+        # torch.cuda.synchronize()
+        # # syko end
+        
+        # decode_start = time.time()
+
+        # for step in range(self.max_new_length-1):
+
+        #     # syko start
+        #     # step=0~4까지 warm-up하고, step=5 진입 직전에 profiler 시작
+        #     if step == profile_warmup:
+        #         torch.cuda.synchronize()
+        #         torch.cuda.cudart().cudaProfilerStart()
+        #         profile_started = True
+
+        #     # 한 decode iteration 전체에 NVTX 이름 부여
+        #     torch.cuda.nvtx.range_push(f"decode_step_{step}")
+        #     # syko end
+
+        #     logits = self.decode_forward(inputs_ids=output_ids)
+        #     output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
+        #     if not ignore_eos:
+        #         end_of_text |= (output_ids == eos_token)
+        #         if end_of_text.all():
+        #             print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
+        #             break
+        #     outputs_ids.append(output_ids)
+
+        #     # syko start
+        #     torch.cuda.nvtx.range_pop()
+
+        #     # step=5, 6 두 iteration이 끝난 뒤 profiler 종료
+        #     if step == profile_warmup + profile_steps - 1:
+        #         torch.cuda.synchronize()
+        #         torch.cuda.cudart().cudaProfilerStop()
+        #         profile_stopped = True
+
+        # # EOS 때문에 capture window 이전에 종료된 예외 처리
+        # if profile_started and not profile_stopped:
+        #     torch.cuda.synchronize()
+        #     torch.cuda.cudart().cudaProfilerStop()
+
+        # # 마지막 decode GPU 작업이 실제로 완료될 때까지 대기
+        # torch.cuda.synchronize()
+
+        # # syko end
+
+        # decode_end = time.time()
         # Decoding
         print("Start decoding ...")
-        decode_start = time.time()
 
-        for _ in range(self.max_new_length-1):
-            logits = self.decode_forward(inputs_ids=output_ids)
-            output_ids = self.sampling(logits, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k)
-            if not ignore_eos:
-                end_of_text |= (output_ids == eos_token)
-                if end_of_text.all():
-                    print(colored("All sequences have reached EOS token, stop decoding.", 'yellow'))
-                    break
-            outputs_ids.append(output_ids)
+        # Nsight Systems profiling configuration
+        profile_warmup = 20
+        profile_steps = 8
 
-        decode_end = time.time()
+        profile_started = False
+        profile_stopped = False
+
+        # Prefill, cache initialization 및 CUDA Graph capture가
+        # decode latency에 섞이지 않도록 완료시킵니다.
+        torch.cuda.synchronize()
+        decode_start = time.perf_counter()
+
+        for step in range(self.max_new_length - 1):
+
+            # step 0~4는 warm-up입니다.
+            # step 5의 CUDA 작업이 제출되기 직전에 profiler를 시작합니다.
+            if step == profile_warmup:
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStart()
+                profile_started = True
+
+            stop_for_eos = False
+
+            # 한 token의 decode-forward와 sampling 전체
+            with torch.cuda.nvtx.range(f"decode_step_{step}"):
+
+                logits = self.decode_forward(
+                    inputs_ids=output_ids,
+                )
+
+                with torch.cuda.nvtx.range("stage/sampling"):
+                    output_ids = self.sampling(
+                        logits,
+                        do_sample=do_sample,
+                        temperature=temperature,
+                        top_p=top_p,
+                        top_k=top_k,
+                    )
+
+                if not ignore_eos:
+                    end_of_text |= (output_ids == eos_token)
+
+                    # 원래 코드도 Python if에서 GPU 결과를 확인하므로
+                    # ignore_eos=False일 때는 synchronization이 발생합니다.
+                    stop_for_eos = bool(end_of_text.all().item())
+
+                # 기존 코드와 동일하게 모든 sequence가 EOS에 도달하면
+                # 해당 output_ids는 결과에 append하지 않습니다.
+                if not stop_for_eos:
+                    outputs_ids.append(output_ids)
+
+            # profile_steps=8이면 step 5~12를 capture합니다.
+            if step == profile_warmup + profile_steps - 1:
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
+                profile_stopped = True
+
+            # 반드시 decode_step NVTX range가 닫힌 뒤 break합니다.
+            if stop_for_eos:
+                print(colored(
+                    "All sequences have reached EOS token, stop decoding.",
+                    "yellow",
+                ))
+                break
+
+        # EOS 등으로 capture window가 조기에 종료된 경우
+        if profile_started and not profile_stopped:
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            profile_stopped = True
+
+        # Nsight capture 이후에 실행된 나머지 decode 작업도 완료
+        torch.cuda.synchronize()
+        decode_end = time.perf_counter()
         print(colored(
             f"Decoding latency: {round((decode_end - decode_start), 4)} s ({round((decode_end - decode_start) * 1000 / (len(outputs_ids) - 1), 2)} ms/step), "
             f"Throughput: {round(self.batch_size * (len(outputs_ids) - 1) / (decode_end - decode_start), 2)} tokens/s",

@@ -962,86 +962,343 @@ class retroinfer_cache(KV_Cache):
             self.trace_step += 1
     # syko end
 
+    # def sparse_attention(self, queries, layer_idx, static_len):
+    #     """
+    #     Sparse Attention
+    #     Args:
+    #         queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
+    #         layer_idx: layer index
+    #         static_len: valid length of steady zone
+    #     """
+    #     self.static_len_tensor.fill_(static_len)
+
+    #     # Softmax(QC^T) -> [batch_size*group_num, group_size, n_centroids]
+    #     batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
+    #                        self.batch_groups, self.group_size, self.n_centroids, self.head_dim, self.RSQRT_DIM, 0)
+    #     torch.sum(self.softmax_o, dim=1, out=self.dist)  # Merge groups -> [batch_size*group_num, n_centroids]
+    #     self.dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)  # mask empty clusters
+    #     torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
+    #     self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # copy the topk cluster ids to the CPU pin memory
+
+    #     # estimation zone attention computation
+    #     if self.es_cluster_num > 0:
+    #         gather_copy_vectors(
+    #             self.centroids[layer_idx], self.es_centroids, 
+    #             self.value_sum[layer_idx], self.es_value_sum, 
+    #             self.cluster_size[layer_idx], self.es_cluster_size,
+    #             self.cI, self.batch_groups, self.n_centroids, self.es_cluster_num, 
+    #             self.max_compute_cluster_num, self.nprobe, self.es_cluster_num
+    #         )
+            
+    #         es_out, es_lse = weighted_flash_decoding(
+    #                             queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
+    #                             self.es_centroids,       # [batch_size*group_num, es_cluster_num, 1, dim]
+    #                             self.es_value_sum,       # [batch_size*group_num, es_cluster_num, 1, dim]
+    #                             self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster_num]
+    #                             previous_out=None, previous_lse=None,
+    #                             return_softmax_lse=True
+    #                         )
+    #     else:
+    #         es_out, es_lse = None, None
+        
+    #     # access cache and submit cache update jobs to thread pool
+    #     self.wave_buffer[layer_idx].batch_access()
+
+    #     # syko modified
+    #     # Trace the residency BEFORE miss pages are admitted to HBM cache.
+    #     self._trace_retrieval_access(layer_idx, static_len)
+    #     # syko end
+
+    #     # assemble the execution buffer
+    #     gather_copy_and_concat(
+    #         self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys, 
+    #         self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], self.execution_buffer_values,
+    #         self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
+    #         self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx], self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
+    #         self.valid_lengths, self.batch_groups, self.static_stride, self.list_stride, self.cache_stride, self.execution_stride, 
+    #         self.buffer_size, self.static_len_tensor
+    #     )
+
+    #     # attention for retrieve zone and steady zone, merge the estimation zone results at the same time
+    #     attn_out = weighted_flash_decoding(
+    #         queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
+    #         self.execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
+    #         self.execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
+    #         previous_out=es_out,
+    #         previous_lse=es_lse,
+    #         cache_seqlens=self.valid_lengths,  # valid lengths of retrieve zone + steady zone for each group
+    #         return_softmax_lse=False
+    #     )
+
+    #     # admit pages from execution buffer to GPU block cache
+    #     self.wave_buffer[layer_idx].sync()  # wait for update LRU finish
+    #     gather_copy_and_scatter(
+    #         self.execution_buffer_keys, self.cache_keys[layer_idx], 
+    #         self.execution_buffer_values, self.cache_values[layer_idx],
+    #         self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], 
+    #         self.update_cache_indices[layer_idx], self.update_num_units[layer_idx], 
+    #         self.batch_groups, self.execution_stride, self.cache_stride,
+    #         self.buffer_size, self.static_len_tensor
+    #     )
+        
+    #     return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
+
     def sparse_attention(self, queries, layer_idx, static_len):
         """
         Sparse Attention
+
         Args:
-            queries: query vector, shape: (batch_size, 1, head_num, dim), gpu torch tensor
-            layer_idx: layer index
-            static_len: valid length of steady zone
+            queries:
+                Query tensor.
+                Shape: (batch_size, 1, num_heads, head_dim)
+            layer_idx:
+                Current transformer layer index.
+            static_len:
+                Valid length of the steady zone.
         """
-        self.static_len_tensor.fill_(static_len)
 
-        # Softmax(QC^T) -> [batch_size*group_num, group_size, n_centroids]
-        batch_gemm_softmax(queries, self.centroids[layer_idx], self.gemm_o, self.norm, self.sum, self.softmax_o,
-                           self.batch_groups, self.group_size, self.n_centroids, self.head_dim, self.RSQRT_DIM, 0)
-        torch.sum(self.softmax_o, dim=1, out=self.dist)  # Merge groups -> [batch_size*group_num, n_centroids]
-        self.dist.masked_fill_(self.centroids_mask[layer_idx], self.DTYPE_MIN)  # mask empty clusters
-        torch.topk(self.dist, self.max_compute_cluster_num, dim=-1, largest=True, sorted=True, out=(self.cV, self.cI))
-        self.cluster_ids.copy_(self.cI[..., :self.nprobe])  # copy the topk cluster ids to the CPU pin memory
+        # ------------------------------------------------------------
+        # 0. Per-layer sparse-attention setup
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/setup"):
+            self.static_len_tensor.fill_(static_len)
 
-        # estimation zone attention computation
-        if self.es_cluster_num > 0:
-            gather_copy_vectors(
-                self.centroids[layer_idx], self.es_centroids, 
-                self.value_sum[layer_idx], self.es_value_sum, 
-                self.cluster_size[layer_idx], self.es_cluster_size,
-                self.cI, self.batch_groups, self.n_centroids, self.es_cluster_num, 
-                self.max_compute_cluster_num, self.nprobe, self.es_cluster_num
+        # ------------------------------------------------------------
+        # 1. Wave-index search
+        #
+        # - Q x centroid score
+        # - group merge
+        # - empty-cluster masking
+        # - top-k cluster selection
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/wave_search"):
+
+            # Softmax(QC^T)
+            # Output:
+            # [batch_size * kv_heads, group_size, n_centroids]
+            batch_gemm_softmax(
+                queries,
+                self.centroids[layer_idx],
+                self.gemm_o,
+                self.norm,
+                self.sum,
+                self.softmax_o,
+                self.batch_groups,
+                self.group_size,
+                self.n_centroids,
+                self.head_dim,
+                self.RSQRT_DIM,
+                0,
             )
-            
-            es_out, es_lse = weighted_flash_decoding(
-                                queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
-                                self.es_centroids,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                                self.es_value_sum,       # [batch_size*group_num, es_cluster_num, 1, dim]
-                                self.es_cluster_size,    # [batch_size*group_num, 1, 1, es_cluster_num]
-                                previous_out=None, previous_lse=None,
-                                return_softmax_lse=True
-                            )
+
+            # Merge query-head groups
+            torch.sum(
+                self.softmax_o,
+                dim=1,
+                out=self.dist,
+            )
+
+            # Remove empty clusters from candidates
+            self.dist.masked_fill_(
+                self.centroids_mask[layer_idx],
+                self.DTYPE_MIN,
+            )
+
+            # Select retrieval-zone + estimation-zone clusters
+            torch.topk(
+                self.dist,
+                self.max_compute_cluster_num,
+                dim=-1,
+                largest=True,
+                sorted=True,
+                out=(self.cV, self.cI),
+            )
+
+        # ------------------------------------------------------------
+        # 2. Selected cluster IDs: GPU -> pinned CPU memory
+        #
+        # This copy is required before WaveBufferCPU can access
+        # selected cluster IDs.
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/selected_ids_d2h"):
+            self.cluster_ids.copy_(
+                self.cI[..., :self.nprobe]
+            )
+
+        # ------------------------------------------------------------
+        # 3. Estimation-zone attention
+        #
+        # - Gather centroid/value-sum/cluster-size metadata
+        # - Compute approximate attention for the estimation zone
+        # ------------------------------------------------------------
+        if self.es_cluster_num > 0:
+
+            with torch.cuda.nvtx.range("ri/estimation_gather"):
+                gather_copy_vectors(
+                    self.centroids[layer_idx],
+                    self.es_centroids,
+                    self.value_sum[layer_idx],
+                    self.es_value_sum,
+                    self.cluster_size[layer_idx],
+                    self.es_cluster_size,
+                    self.cI,
+                    self.batch_groups,
+                    self.n_centroids,
+                    self.es_cluster_num,
+                    self.max_compute_cluster_num,
+                    self.nprobe,
+                    self.es_cluster_num,
+                )
+
+            with torch.cuda.nvtx.range("ri/estimation_attention"):
+                es_out, es_lse = weighted_flash_decoding(
+                    queries.view(
+                        self.batch_groups,
+                        1,
+                        self.group_size,
+                        self.head_dim,
+                    ),
+                    self.es_centroids,
+                    self.es_value_sum,
+                    self.es_cluster_size,
+                    previous_out=None,
+                    previous_lse=None,
+                    return_softmax_lse=True,
+                )
+
         else:
             es_out, es_lse = None, None
-        
-        # access cache and submit cache update jobs to thread pool
-        self.wave_buffer[layer_idx].batch_access()
 
-        # syko modified
-        # Trace the residency BEFORE miss pages are admitted to HBM cache.
-        self._trace_retrieval_access(layer_idx, static_len)
-        # syko end
+        # ------------------------------------------------------------
+        # 4. CPU WaveBuffer access
+        #
+        # This C++ call:
+        # - reads selected cluster IDs
+        # - performs hit/miss lookup
+        # - prepares gather metadata
+        # - submits the asynchronous cache/LRU update job
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/cpu_batch_access"):
+            self.wave_buffer[layer_idx].batch_access()
 
-        # assemble the execution buffer
-        gather_copy_and_concat(
-            self.steady_zone_keys[layer_idx], self.list_keys[layer_idx], self.cache_keys[layer_idx], self.execution_buffer_keys, 
-            self.steady_zone_values[layer_idx], self.list_values[layer_idx], self.cache_values[layer_idx], self.execution_buffer_values,
-            self.miss_unit_idices[layer_idx], self.miss_unit_sizes[layer_idx], self.miss_unit_sizes_cumsum[layer_idx], self.miss_num_units[layer_idx],
-            self.hit_unit_idices[layer_idx], self.hit_unit_sizes[layer_idx], self.hit_unit_sizes_cumsum[layer_idx], self.hit_num_units[layer_idx],
-            self.valid_lengths, self.batch_groups, self.static_stride, self.list_stride, self.cache_stride, self.execution_stride, 
-            self.buffer_size, self.static_len_tensor
+        # ------------------------------------------------------------
+        # 5. Optional metadata logger
+        #
+        # Disable RETRO_TRACE for the Nsight performance run.
+        # Enable it only for the separate metadata-collection run.
+        # ------------------------------------------------------------
+        if self.trace_enabled:
+            with torch.cuda.nvtx.range("ri/metadata_trace"):
+                self._trace_retrieval_access(
+                    layer_idx,
+                    static_len,
+                )
+
+        # ------------------------------------------------------------
+        # 6. Execution-buffer assembly
+        #
+        # - GPU-cache hit KV
+        # - CPU-side miss KV
+        # - steady-zone KV
+        #
+        # are assembled into one execution buffer.
+        # GPU kernel: concat_gather_copy
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/execution_gather"):
+            gather_copy_and_concat(
+                self.steady_zone_keys[layer_idx],
+                self.list_keys[layer_idx],
+                self.cache_keys[layer_idx],
+                self.execution_buffer_keys,
+
+                self.steady_zone_values[layer_idx],
+                self.list_values[layer_idx],
+                self.cache_values[layer_idx],
+                self.execution_buffer_values,
+
+                self.miss_unit_idices[layer_idx],
+                self.miss_unit_sizes[layer_idx],
+                self.miss_unit_sizes_cumsum[layer_idx],
+                self.miss_num_units[layer_idx],
+
+                self.hit_unit_idices[layer_idx],
+                self.hit_unit_sizes[layer_idx],
+                self.hit_unit_sizes_cumsum[layer_idx],
+                self.hit_num_units[layer_idx],
+
+                self.valid_lengths,
+                self.batch_groups,
+                self.static_stride,
+                self.list_stride,
+                self.cache_stride,
+                self.execution_stride,
+                self.buffer_size,
+                self.static_len_tensor,
+            )
+
+        # ------------------------------------------------------------
+        # 7. Exact attention
+        #
+        # Compute attention over:
+        # - retrieve zone
+        # - steady zone
+        #
+        # and merge the estimation-zone partial result.
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/precise_attention"):
+            attn_out = weighted_flash_decoding(
+                queries.view(
+                    self.batch_groups,
+                    1,
+                    self.group_size,
+                    self.head_dim,
+                ),
+                self.execution_buffer_keys,
+                self.execution_buffer_values,
+                previous_out=es_out,
+                previous_lse=es_lse,
+                cache_seqlens=self.valid_lengths,
+                return_softmax_lse=False,
+            )
+
+        # ------------------------------------------------------------
+        # 8. Wait for asynchronous LRU/cache-update metadata
+        #
+        # This range is directly meaningful as CPU critical-path wait.
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/cache_update_wait"):
+            self.wave_buffer[layer_idx].sync()
+
+        # ------------------------------------------------------------
+        # 9. Admit selected execution-buffer pages into GPU block cache
+        #
+        # GPU kernel: gather_copy_scatter
+        # ------------------------------------------------------------
+        with torch.cuda.nvtx.range("ri/cache_admission"):
+            gather_copy_and_scatter(
+                self.execution_buffer_keys,
+                self.cache_keys[layer_idx],
+                self.execution_buffer_values,
+                self.cache_values[layer_idx],
+
+                self.update_buffer_indices[layer_idx],
+                self.update_unit_sizes[layer_idx],
+                self.update_cache_indices[layer_idx],
+                self.update_num_units[layer_idx],
+
+                self.batch_groups,
+                self.execution_stride,
+                self.cache_stride,
+                self.buffer_size,
+                self.static_len_tensor,
+            )
+
+        return attn_out.view(
+            self.batch_size,
+            1,
+            self.num_heads,
+            self.head_dim,
         )
-
-        # attention for retrieve zone and steady zone, merge the estimation zone results at the same time
-        attn_out = weighted_flash_decoding(
-            queries.view(self.batch_groups, 1, self.group_size, self.head_dim), 
-            self.execution_buffer_keys,    # (batch_size*group_num, execution_stride, 1, dim)
-            self.execution_buffer_values,  # (batch_size*group_num, execution_stride, 1, dim)
-            previous_out=es_out,
-            previous_lse=es_lse,
-            cache_seqlens=self.valid_lengths,  # valid lengths of retrieve zone + steady zone for each group
-            return_softmax_lse=False
-        )
-
-        # admit pages from execution buffer to GPU block cache
-        self.wave_buffer[layer_idx].sync()  # wait for update LRU finish
-        gather_copy_and_scatter(
-            self.execution_buffer_keys, self.cache_keys[layer_idx], 
-            self.execution_buffer_values, self.cache_values[layer_idx],
-            self.update_buffer_indices[layer_idx], self.update_unit_sizes[layer_idx], 
-            self.update_cache_indices[layer_idx], self.update_num_units[layer_idx], 
-            self.batch_groups, self.execution_stride, self.cache_stride,
-            self.buffer_size, self.static_len_tensor
-        )
-        
-        return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
 
 
     def sparse_attention_with_cudagraph(self, queries, layer_idx, static_len):

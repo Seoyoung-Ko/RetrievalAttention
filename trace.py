@@ -5,8 +5,8 @@ import os
 import numpy as np
 import pandas as pd
 
-TRACE_GLOB = "./traces/**/*.csv"
-OUT_DIR = "./analysis/result"
+TRACE_GLOB = "./traces/ruler_cache_ratio/0.025/**/*.csv"
+OUT_DIR = "./analysis/result/cache_ratio/0.025"
 
 
 
@@ -126,12 +126,6 @@ def main():
     print(summary.to_string(index=False))
     print()
     print("Wrote:", OUT_DIR)
-
-    steady = df[df["decode_step"] >= 64]
-
-    for col in ["D_MiB", "R_MiB", "hit_ratio"]:
-        print(col)
-        print(steady[col].quantile([0.05, 0.5, 0.95]))
 
 
 if __name__ == "__main__":
