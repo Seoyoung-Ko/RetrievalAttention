@@ -2,6 +2,7 @@
 #include <torch/extension.h>
 
 #include <iostream>
+#include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
 #include <list>
@@ -189,7 +190,8 @@ public:
     inline std::tuple<int, int, int, int> batch_access(
         const int64_t* keys, const int num, 
         int* hit_block_ids, int* hit_block_sizes, int* hit_block_sizes_cumsum,
-        int* miss_block_ids, int* miss_block_sizes, int* miss_block_sizes_cumsum
+        int* miss_block_ids, int* miss_block_sizes, int* miss_block_sizes_cumsum,
+        int8_t* selected_cluster_residency
     ) noexcept {
         if (num == 0) {
             return { 0, 0, 0, 0 };
@@ -202,6 +204,15 @@ public:
         int hit_cumsum = 0;
         int miss_cumsum = 0;
         int consider_block_num = 0;
+
+        // Trace-off keeps this pointer null, so it adds no per-selection work.
+        // Trace-on logs all selected clusters even if a later capacity guard
+        // prevents some from contributing pages to this retrieval.
+        if (selected_cluster_residency != nullptr) {
+            for (int i = 0; i < num; ++i) {
+                selected_cluster_residency[i] = cluster_descriptors[keys[i]].inBlockCache ? 1 : 0;
+            }
+        }
 
         for (int i = 0; i < num; ++i) {
             const int64_t& key = keys[i];
@@ -282,6 +293,7 @@ private:
 
     // pointer to the retrieved clusters, [batch_size*group_num, nprobe]
     int64_t* searched_clusters_ptr;         
+    int8_t* selected_cluster_residency;     // 1 = HBM cache, 0 = CPU list
 
     // input data to re-organize keys & values based on the clustering results
     // groups = prefill_bsz*group_num when build index during prefilling
@@ -343,6 +355,7 @@ public:
         cluster_size_ptr = nullptr;
 
         searched_clusters_ptr = nullptr;
+        selected_cluster_residency = nullptr;
 
         hit_block_ids = nullptr;
         hit_block_sizes = nullptr;
@@ -417,6 +430,7 @@ public:
         cluster_size_ptr = nullptr;
 
         searched_clusters_ptr = nullptr;
+        selected_cluster_residency = nullptr;
 
         hit_block_ids = nullptr;
         hit_block_sizes = nullptr;
@@ -478,6 +492,12 @@ public:
 
         searched_clusters_ptr = static_cast<int64_t*>(searched_clusters.data_ptr<int64_t>());
         // AT_ASSERT(searched_clusters.size(-1) == nprobe, "Wrong searched clusters size.");
+    }
+
+    void set_trace_residency(torch::Tensor& selected_cluster_residency_tensor) {
+        selected_cluster_residency = static_cast<int8_t*>(
+            selected_cluster_residency_tensor.data_ptr<int8_t>()
+        );
     }
 
     void set_kv(
@@ -716,6 +736,8 @@ public:
             auto miss_block_ids_group = miss_block_ids + i * buffer_size;
             auto miss_block_sizes_group = miss_block_sizes + i * buffer_size;
             auto miss_block_sizes_cumsum_group = miss_block_sizes_cumsum + i * buffer_size;
+            auto residency_group = selected_cluster_residency == nullptr
+                ? nullptr : selected_cluster_residency + i * nprobe;
             // access buffer manager
             auto [hit_num, miss_num, hit_block_num, miss_block_num] = caches[i]->batch_access(searched_clusters_ptr + i * nprobe, nprobe, 
                                                                                               hit_block_ids_group,
@@ -723,7 +745,8 @@ public:
                                                                                               hit_block_sizes_cumsum_group,
                                                                                               miss_block_ids_group,
                                                                                               miss_block_sizes_group,
-                                                                                              miss_block_sizes_cumsum_group);
+                                                                                              miss_block_sizes_cumsum_group,
+                                                                                              residency_group);
             // std::fill(hit_block_ids_group + hit_block_num, hit_block_ids_group + buffer_size, -1);
             // std::fill(hit_block_sizes_group + hit_block_num, hit_block_sizes_group + buffer_size, 0);
             // std::fill(hit_block_sizes_cumsum_group + hit_block_num, hit_block_sizes_cumsum_group + buffer_size, hit_block_sizes_cumsum_group[hit_block_num - 1]);
@@ -811,6 +834,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("miss_block_ids"), py::arg("miss_block_sizes"), py::arg("miss_block_sizes_cumsum"), py::arg("miss_block_nums"),
             py::arg("update_buffer_indices"), py::arg("update_block_sizes"), py::arg("update_cache_indices"), py::arg("update_block_nums"), 
             py::arg("searched_clusters"))
+        .def("set_trace_residency", &WaveBufferCPU::set_trace_residency,
+            py::arg("selected_cluster_residency"))
         .def("set_kv", &WaveBufferCPU::set_kv, 
             py::arg("ivf_key"), py::arg("ivf_value"), py::arg("input_keys"), py::arg("input_values"))
         .def("async_construction", &WaveBufferCPU::async_construction, 

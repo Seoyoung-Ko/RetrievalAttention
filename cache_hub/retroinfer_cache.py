@@ -9,9 +9,9 @@ from weighted_flash_decoding import weighted_flash_decoding
 
 # syko modified
 import csv
+import atexit
 import math
 import os
-import time 
 import uuid
 from datetime import datetime
 # syko end
@@ -66,24 +66,53 @@ class retroinfer_cache(KV_Cache):
 
         # syko modified
         # ------------------------------------------------------------
-        # Trace configuration: proposed instrumentation, not upstream.
-        # ------------------------------------------------------------
+        # Compact retrieval trace: selected cluster IDs, their authoritative
+        # residency at lookup time, and event-level cache hit ratios only.
         self.trace_enabled = os.environ.get("RETRO_TRACE", "0") == "1"
-        self.trace_run_id = os.environ.get("RETRO_TRACE_RUN_ID", "run")
-        self.trace_task = os.environ.get("RETRO_TRACE_TASK", "unknown")
-        self.trace_step = 0
-        self.trace_rows = 0
-        self.trace_flush_interval = int(
-            os.environ.get("RETRO_TRACE_FLUSH_INTERVAL", "128")
+
+        if self.trace_enabled and use_cuda_graph:
+            raise ValueError(
+                "RetroInfer retrieval tracing requires use_cuda_graph=False; "
+                "a replayed CUDA graph cannot emit one host trace event per layer."
+            )
+
+        self.trace_run_id = os.environ.get(
+            "RETRO_TRACE_RUN_ID",
+            "run",
         )
 
-        self.retrieval_budget_cfg = float(retrieval_budget)
-        self.estimation_budget_cfg = float(estimation_budget)
-        self.cache_ratio_cfg = float(cache_ratio)
+        self.trace_task = os.environ.get(
+            "RETRO_TRACE_TASK",
+            "unknown",
+        )
 
-        self.trace_file = None
-        self.trace_writer = None
-        self.trace_cache_id = None
+        self.trace_sample_id = os.environ.get(
+            "RETRO_TRACE_SAMPLE_ID",
+            "sample0",
+        )
+
+        self.trace_cache_ratio = float(cache_ratio)
+        self.trace_warmup_steps = int(
+            os.environ.get("RETRO_TRACE_WARMUP_STEPS", "8")
+        )
+        # One selected vector reads one K and one V vector for this KV head.
+        self.trace_bytes_per_vector = (
+            2 * self.head_dim * torch.empty((), dtype=self.dtype).element_size()
+        )
+
+        self.trace_step = 0
+        self.trace_rows = 0
+
+        self.trace_flush_interval = int(
+            os.environ.get(
+                "RETRO_TRACE_FLUSH_INTERVAL",
+                "4096",
+            )
+        )
+
+        self.trace_session_id = None
+        self.trace_files = {}
+        self.trace_writers = {}
         # syko end
 
         self.page_size = 8
@@ -250,6 +279,14 @@ class retroinfer_cache(KV_Cache):
         ]
         # store searched TopK cluster IDs
         self.cluster_ids = torch.empty((self.batch_groups, self.nprobe), dtype=torch.int64, pin_memory=True).contiguous()
+        # Allocated only for tracing; trace-off performs no residency writes.
+        self.selected_cluster_residency = None
+        if self.trace_enabled:
+            self.selected_cluster_residency = torch.empty(
+                (self.batch_groups, self.nprobe + self.nprobe_new),
+                dtype=torch.int8,
+                pin_memory=True,
+            ).contiguous()
 
         for ldx in range(self.layer_num):
             self.wave_buffer[ldx].set_indices(
@@ -258,69 +295,14 @@ class retroinfer_cache(KV_Cache):
                 self.update_buffer_indices[ldx], self.update_unit_sizes[ldx], self.update_cache_indices[ldx], self.update_num_units[ldx], 
                 self.cluster_ids
             )
+            if self.trace_enabled:
+                self.wave_buffer[ldx].set_trace_residency(
+                    self.selected_cluster_residency
+                )
         # syko modified
         if self.trace_enabled:
-            trace_dir = os.environ.get("RETRO_TRACE_DIR", "./retro_trace")
-            os.makedirs(trace_dir, exist_ok=True)
-
-            safe_run_id = "".join(
-                ch if ch.isalnum() or ch in "-_." else "_"
-                for ch in self.trace_run_id
-            )
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.trace_cache_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
-            
-            trace_path = os.path.join(
-                trace_dir,
-                f"{safe_run_id}_{self.trace_cache_id}.csv",
-            )
-
-            self.trace_file = open(
-                trace_path,
-                "w",
-                newline="",
-                buffering=1,
-            )
-
-            fields = [
-                "run_id",
-                "cache_id",
-                "task",
-                "request_idx",
-                "decode_step",
-                "layer",
-                "input_context_len",
-                "current_context_len",
-                "batch_size",
-                "kv_heads",
-                "head_dim",
-                "dtype_bytes",
-                "n_centroids",
-                "nprobe",
-                "retrieval_budget",
-                "estimation_budget",
-                "cache_ratio",
-                "cache_pages_per_head",
-                "static_len",
-                "hit_pages",
-                "miss_pages",
-                "hit_vectors",
-                "miss_vectors",
-                "selected_vectors",
-                "hit_bytes",
-                "remote_bytes",
-                "selected_bytes",
-                "hit_ratio",
-            ]
-
-            self.trace_writer = csv.DictWriter(
-                self.trace_file,
-                fieldnames=fields,
-            )
-            self.trace_writer.writeheader()
-
-            print(f"[RetroTrace] writing {trace_path}")
-            # syko end
+            self._init_trace_output()
+        # syko end
 
         if self.allocated:  # allocate GPU block cache and meta index
             self.cache_keys, self.cache_values = [], []
@@ -843,123 +825,134 @@ class retroinfer_cache(KV_Cache):
             )
         return attn_out.view(self.batch_size, 1, self.num_heads, self.head_dim)
 
-    # syko modified
-    def _trace_retrieval_access(self, layer_idx, static_len):
-        """Record pre-attention retrieval working-set residency.
+    def _init_trace_output(self):
+        trace_dir = os.environ.get("RETRO_TRACE_DIR", "./retro_trace")
+        os.makedirs(trace_dir, exist_ok=True)
+        safe_run_id = "".join(
+            ch if ch.isalnum() or ch in "-_."
+            else "_"
+            for ch in self.trace_run_id
+        )
+        self.trace_session_id = (
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        )
+        path = os.path.join(
+            trace_dir,
+            f"{safe_run_id}_{self.trace_session_id}_retrieval.csv",
+        )
+        trace_file = open(path, "w", newline="", buffering=1024 * 1024)
+        fields = [
+            "run_id", "trace_session_id", "task", "sample_id",
+            "request_idx", "batch_group_idx", "kv_head_group",
+            "decode_step", "layer", "current_context_len", "batch_size",
+            "cache_ratio", "cache_state",
+            "selected_clusters", "hbm_clusters", "cpu_clusters",
+            "selected_cluster_ids", "selected_residency",
+            "selected_vectors", "hit_vectors", "miss_vectors",
+            "selected_bytes", "hit_bytes", "miss_bytes", "byte_hit_ratio",
+        ]
+        self.trace_files = {"retrieval": trace_file}
+        self.trace_writers = {
+            "retrieval": csv.DictWriter(trace_file, fieldnames=fields)
+        }
+        self.trace_writers["retrieval"].writeheader()
+        print(f"[RetroTrace] writing {path}")
+        atexit.register(self._close_trace_output)
 
-        One output row = one request, one decode step, one layer.
-        Values are aggregated over all KV heads of that request.
-        """
+    def _trace_retrieval_access(self, layer_idx, static_len, decode_step):
+        """Write selected IDs and lookup-time residency before cache admission."""
         if not self.trace_enabled:
             return
 
-        dtype_bytes = torch.empty(
-            (),
-            dtype=self.dtype,
-        ).element_size()
-
-        for request_idx in range(self.batch_size):
-            group_start = request_idx * self.kv_head
-            group_end = group_start + self.kv_head
-
-            hit_pages = 0
-            miss_pages = 0
-            hit_vectors = 0
-            miss_vectors = 0
-
-            for group_idx in range(group_start, group_end):
-                n_hit = int(
-                    self.hit_num_units[layer_idx][group_idx].item()
-                )
-                n_miss = int(
-                    self.miss_num_units[layer_idx][group_idx].item()
-                )
-
-                hit_pages += n_hit
-                miss_pages += n_miss
-
-                if n_hit > 0:
-                    hit_vectors += int(
-                        self.hit_unit_sizes[layer_idx][
-                            group_idx, :n_hit
-                        ].sum().item()
-                    )
-
-                if n_miss > 0:
-                    miss_vectors += int(
-                        self.miss_unit_sizes[layer_idx][
-                            group_idx, :n_miss
-                        ].sum().item()
-                    )
-
+        writer = self.trace_writers["retrieval"]
+        for batch_group_idx in range(self.batch_groups):
+            n_hit = int(self.hit_num_units[layer_idx][batch_group_idx].item())
+            n_miss = int(self.miss_num_units[layer_idx][batch_group_idx].item())
+            hit_vectors = (
+                int(self.hit_unit_sizes[layer_idx][batch_group_idx, :n_hit].sum().item())
+                if n_hit else 0
+            )
+            miss_vectors = (
+                int(self.miss_unit_sizes[layer_idx][batch_group_idx, :n_miss].sum().item())
+                if n_miss else 0
+            )
             selected_vectors = hit_vectors + miss_vectors
-
-            # K and V are both read.
-            bytes_per_selected_vector = (
-                2 * self.head_dim * dtype_bytes
+            selected_bytes = selected_vectors * self.trace_bytes_per_vector
+            hit_bytes = hit_vectors * self.trace_bytes_per_vector
+            miss_bytes = miss_vectors * self.trace_bytes_per_vector
+            residency = self.selected_cluster_residency[
+                batch_group_idx, :self.nprobe
+            ].tolist()
+            cluster_ids = self.cluster_ids[
+                batch_group_idx, :self.nprobe
+            ].tolist()
+            hbm_clusters = sum(residency)
+            request_idx = batch_group_idx // self.kv_head
+            context_len = (
+                self.input_length
+                - int(self.valid_start_list[request_idx])
+                + 1
+                + decode_step
             )
-
-            hit_bytes = hit_vectors * bytes_per_selected_vector
-            remote_bytes = miss_vectors * bytes_per_selected_vector
-            selected_bytes = selected_vectors * bytes_per_selected_vector
-
-            hit_ratio = (
-                hit_bytes / selected_bytes
-                if selected_bytes > 0
-                else 0.0
+            cache_state = (
+                "cold" if decode_step == 0
+                else "warming" if decode_step < self.trace_warmup_steps
+                else "steady"
             )
-
-            # input_length is padded batch length.
-            # valid_start_list gives left-padding for each request.
-            valid_start = int(self.valid_start_list[request_idx])
-            actual_input_len = self.input_length - valid_start
-
-            # The first generated token is produced by prefill.
-            # At trace step 0, its KV has already been appended.
-            current_context_len = (
-                actual_input_len + 1 + self.trace_step
-            )
-
-            self.trace_writer.writerow({
+            writer.writerow({
                 "run_id": self.trace_run_id,
-                "cache_id": self.trace_cache_id,
+                "trace_session_id": self.trace_session_id,
                 "task": self.trace_task,
+                "sample_id": self.trace_sample_id,
                 "request_idx": request_idx,
-                "decode_step": self.trace_step,
+                "batch_group_idx": batch_group_idx,
+                "kv_head_group": batch_group_idx % self.kv_head,
+                "decode_step": decode_step,
                 "layer": layer_idx,
-                "input_context_len": actual_input_len,
-                "current_context_len": current_context_len,
+                "current_context_len": context_len,
                 "batch_size": self.batch_size,
-                "kv_heads": self.kv_head,
-                "head_dim": self.head_dim,
-                "dtype_bytes": dtype_bytes,
-                "n_centroids": self.n_centroids,
-                "nprobe": self.nprobe,
-                "retrieval_budget": self.retrieval_budget_cfg,
-                "estimation_budget": self.estimation_budget_cfg,
-                "cache_ratio": self.cache_ratio_cfg,
-                "cache_pages_per_head": self.cache_size,
-                "static_len": int(static_len),
-                "hit_pages": hit_pages,
-                "miss_pages": miss_pages,
+                "cache_ratio": self.trace_cache_ratio,
+                "cache_state": cache_state,
+                "selected_clusters": self.nprobe,
+                "hbm_clusters": hbm_clusters,
+                "cpu_clusters": self.nprobe - hbm_clusters,
+                "selected_cluster_ids": ";".join(map(str, cluster_ids)),
+                "selected_residency": ";".join(
+                    "H" if in_hbm else "C" for in_hbm in residency
+                ),
+                "selected_vectors": selected_vectors,
                 "hit_vectors": hit_vectors,
                 "miss_vectors": miss_vectors,
-                "selected_vectors": selected_vectors,
-                "hit_bytes": hit_bytes,
-                "remote_bytes": remote_bytes,
                 "selected_bytes": selected_bytes,
-                "hit_ratio": hit_ratio,
+                "hit_bytes": hit_bytes,
+                "miss_bytes": miss_bytes,
+                "byte_hit_ratio": (
+                    hit_bytes / selected_bytes if selected_bytes else 0.0
+                ),
             })
-
             self.trace_rows += 1
 
         if self.trace_rows >= self.trace_flush_interval:
-            self.trace_file.flush()
+            self._flush_trace_output()
+
+    def _trace_finish_layer(self, layer_idx):
+        if self.trace_enabled and layer_idx == self.layer_num - 1:
+            self.trace_step += 1
+
+    def _flush_trace_output(self):
+        if self.trace_enabled:
+            self.trace_files["retrieval"].flush()
             self.trace_rows = 0
 
-        # All layers for one decode token use the same trace_step.
-        if layer_idx == self.layer_num - 1:
-            self.trace_step += 1
+    def _close_trace_output(self):
+        for trace_file in self.trace_files.values():
+            try:
+                trace_file.flush()
+                trace_file.close()
+            except Exception:
+                pass
+        self.trace_files = {}
+        self.trace_writers = {}
     # syko end
 
     # def sparse_attention(self, queries, layer_idx, static_len):
@@ -1056,7 +1049,7 @@ class retroinfer_cache(KV_Cache):
             static_len:
                 Valid length of the steady zone.
         """
-
+        trace_decode_step = self.trace_step
         # ------------------------------------------------------------
         # 0. Per-layer sparse-attention setup
         # ------------------------------------------------------------
@@ -1181,18 +1174,13 @@ class retroinfer_cache(KV_Cache):
         with torch.cuda.nvtx.range("ri/cpu_batch_access"):
             self.wave_buffer[layer_idx].batch_access()
 
-        # ------------------------------------------------------------
-        # 5. Optional metadata logger
-        #
-        # Disable RETRO_TRACE for the Nsight performance run.
-        # Enable it only for the separate metadata-collection run.
-        # ------------------------------------------------------------
-        if self.trace_enabled:
-            with torch.cuda.nvtx.range("ri/metadata_trace"):
-                self._trace_retrieval_access(
-                    layer_idx,
-                    static_len,
-                )
+        # WaveBufferCPU has now completed the authoritative cache lookup, but
+        # its asynchronous admission has not yet been copied into HBM.
+        self._trace_retrieval_access(
+            layer_idx=layer_idx,
+            static_len=static_len,
+            decode_step=trace_decode_step,
+        )
 
         # ------------------------------------------------------------
         # 6. Execution-buffer assembly
@@ -1292,6 +1280,8 @@ class retroinfer_cache(KV_Cache):
                 self.buffer_size,
                 self.static_len_tensor,
             )
+
+        self._trace_finish_layer(layer_idx)
 
         return attn_out.view(
             self.batch_size,
