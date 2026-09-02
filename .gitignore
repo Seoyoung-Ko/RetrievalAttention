@@ -420,3 +420,6 @@ profiles/
 run_mode_map.sh
 traces/
 trace.py
+figures/
+pilot_results/
+benchmark_results/
