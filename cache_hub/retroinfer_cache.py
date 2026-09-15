@@ -113,6 +113,61 @@ class retroinfer_cache(KV_Cache):
         self.trace_session_id = None
         self.trace_files = {}
         self.trace_writers = {}
+
+        self.attn_trace_enabled = os.environ.get("RETRO_WEIGHT_TRACE", "0") == "1"
+        self.attn_trace_max_groups = int(
+            os.environ.get("RETRO_WEIGHT_TRACE_MAX_GROUPS", "1")
+        )
+        self.attn_trace_max_steps = int(
+            os.environ.get("RETRO_WEIGHT_TRACE_MAX_STEPS", "0")
+        )
+        self.attn_trace_max_kv_pos = int(
+            os.environ.get("RETRO_WEIGHT_TRACE_MAX_KV_POS", "0")
+        )
+        self.attn_trace_head_stride = int(
+            os.environ.get("RETRO_WEIGHT_TRACE_HEAD_STRIDE", "1")
+        )
+        self.attn_trace_bucket_size = int(
+            os.environ.get("RETRO_WEIGHT_TRACE_BUCKET_SIZE", "0")
+        )
+        self.attn_trace_selected_only = (
+            os.environ.get("RETRO_WEIGHT_TRACE_SELECTED_ONLY", "1") == "1"
+        )
+        # Kept only so older launch scripts remain accepted.  The requested
+        # panel-(a) heatmap is a full-context distribution; restricting rows to
+        # RetroInfer's compact execution buffer loses the original positions.
+        if self.attn_trace_max_groups <= 0:
+            raise ValueError("RETRO_WEIGHT_TRACE_MAX_GROUPS must be positive")
+        if self.attn_trace_head_stride <= 0:
+            raise ValueError("RETRO_WEIGHT_TRACE_HEAD_STRIDE must be positive")
+        if self.attn_trace_bucket_size < 0:
+            raise ValueError("RETRO_WEIGHT_TRACE_BUCKET_SIZE cannot be negative")
+        self.topk_trace_enabled = os.environ.get("RETRO_TOPK_TRACE", "0") == "1"
+        self.topk_trace_k = int(os.environ.get("RETRO_TOPK_TRACE_K", "100"))
+        if self.topk_trace_enabled and not self.attn_trace_enabled:
+            raise ValueError("RETRO_TOPK_TRACE requires RETRO_WEIGHT_TRACE=1")
+        if self.topk_trace_k <= 0:
+            raise ValueError("RETRO_TOPK_TRACE_K must be positive")
+        raw_layers = os.environ.get("RETRO_WEIGHT_TRACE_LAYERS", "")
+        if raw_layers.strip():
+            self.attn_trace_layers = {
+                int(v.strip()) for v in raw_layers.split(",") if v.strip()
+            }
+        else:
+            self.attn_trace_layers = None
+        self.attn_trace_session_id = None
+        self.attn_trace_file = None
+        self.attn_trace_writer = None
+        self.topk_trace_file = None
+        self.topk_trace_writer = None
+        # The execution buffer is compacted by retrieval and therefore does not
+        # preserve original token positions.  Keep the (small, user-selected)
+        # set of K heads in token order so an attention trace really uses the
+        # positions shown on the heatmap's y axis.
+        self.attn_trace_keys = {}
+        self.attn_trace_key_lengths = {}
+        if self.attn_trace_enabled:
+            self._init_attention_trace_output()
         # syko end
 
         self.page_size = 8
@@ -576,6 +631,13 @@ class retroinfer_cache(KV_Cache):
         # assert head_dim == self.head_dim, f"head_dim({head_dim}) should equal to self.head_dim({self.head_dim})"
 
         valid_start = self.valid_start_list[start_bdx]
+
+        self._capture_prefill_attention_trace_keys(
+            key_states=key_states,
+            layer_idx=layer_idx,
+            start_bdx=start_bdx,
+            valid_start=valid_start,
+        )
         
         if self.build_index_when_prefilling:
             # sync for the previous layer and batch finish their page organization
@@ -792,6 +854,8 @@ class retroinfer_cache(KV_Cache):
         value_states,       # (bsz, seq_len(=1), group_num, dim)
         layer_idx
     ):
+        self._append_decode_attention_trace_keys(key_states, layer_idx)
+
         # index update when generate tokens exceed UPDATE_SEGMENT
         if self.static_pattern_total == self.static_pattern_start + self.static_pattern_end + self.UPDATE_SEGMENT:
             self._update_kv_cache()
@@ -935,8 +999,242 @@ class retroinfer_cache(KV_Cache):
         if self.trace_rows >= self.trace_flush_interval:
             self._flush_trace_output()
 
+    def _init_attention_trace_output(self):
+        if not self.attn_trace_enabled:
+            return
+        trace_dir = os.environ.get("RETRO_TRACE_DIR", "./retro_trace")
+        os.makedirs(trace_dir, exist_ok=True)
+        safe_run_id = "".join(
+            ch if ch.isalnum() or ch in "-_."
+            else "_"
+            for ch in self.trace_run_id
+        )
+        self.attn_trace_session_id = (
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        )
+        path = os.path.join(
+            trace_dir,
+            f"{safe_run_id}_{self.attn_trace_session_id}_attention.csv",
+        )
+        trace_file = open(path, "w", newline="", buffering=1024 * 1024)
+        fields = [
+            "run_id", "trace_session_id", "task", "sample_id",
+            "request_idx", "batch_group_idx", "kv_head_group",
+            "layer", "decode_step", "kv_position", "query_head",
+            "attention_weight", "kv_bucket_size", "position_space",
+            "attention_scope",
+        ]
+        self.attn_trace_file = trace_file
+        self.attn_trace_writer = csv.DictWriter(trace_file, fieldnames=fields)
+        self.attn_trace_writer.writeheader()
+        print(f"[RetroAttentionTrace] writing {path}")
+        if self.topk_trace_enabled:
+            self._init_topk_trace_output(trace_dir, safe_run_id)
+        atexit.register(self._close_attention_trace_output)
+
+    def _init_topk_trace_output(self, trace_dir, safe_run_id):
+        path = os.path.join(
+            trace_dir,
+            f"{safe_run_id}_{self.attn_trace_session_id}_topk_kv.csv",
+        )
+        trace_file = open(path, "w", newline="", buffering=1024 * 1024)
+        fields = [
+            "run_id", "trace_session_id", "task", "sample_id",
+            "request_idx", "batch_group_idx", "kv_head_group",
+            "layer", "decode_step", "query_head", "top_k",
+            "selected_kv_positions", "position_space", "selection_scope",
+        ]
+        self.topk_trace_file = trace_file
+        self.topk_trace_writer = csv.DictWriter(trace_file, fieldnames=fields)
+        self.topk_trace_writer.writeheader()
+        print(f"[RetroTopKTrace] writing {path}")
+
+    def _attention_layer_is_traced(self, layer_idx):
+        return (
+            self.attn_trace_enabled
+            and (
+                self.attn_trace_layers is None
+                or layer_idx in self.attn_trace_layers
+            )
+        )
+
+    def _ensure_attention_trace_key_buffer(self, layer_idx, device):
+        if layer_idx in self.attn_trace_keys:
+            return
+        group_count = min(self.attn_trace_max_groups, self.batch_groups)
+        self.attn_trace_keys[layer_idx] = torch.empty(
+            (group_count, self.max_length, self.head_dim),
+            dtype=self.dtype,
+            device=device,
+        )
+        self.attn_trace_key_lengths[layer_idx] = [0] * group_count
+
+    def _capture_prefill_attention_trace_keys(
+        self,
+        key_states,
+        layer_idx,
+        start_bdx,
+        valid_start,
+    ):
+        """Save traced K heads in original, unpadded token order."""
+        if not self._attention_layer_is_traced(layer_idx):
+            return
+        self._ensure_attention_trace_key_buffer(layer_idx, key_states.device)
+        key_buffer = self.attn_trace_keys[layer_idx]
+        lengths = self.attn_trace_key_lengths[layer_idx]
+        valid_keys = key_states[:, valid_start:, :, :]
+
+        for local_batch_idx in range(valid_keys.size(0)):
+            request_idx = start_bdx + local_batch_idx
+            for kv_head_idx in range(self.kv_head):
+                group_idx = request_idx * self.kv_head + kv_head_idx
+                if group_idx >= key_buffer.size(0):
+                    continue
+                keys = valid_keys[local_batch_idx, :, kv_head_idx, :]
+                key_buffer[group_idx, :keys.size(0)].copy_(keys)
+                lengths[group_idx] = keys.size(0)
+
+    def _append_decode_attention_trace_keys(self, key_states, layer_idx):
+        """Append the current decode token before its query is traced."""
+        if not self._attention_layer_is_traced(layer_idx):
+            return
+        self._ensure_attention_trace_key_buffer(layer_idx, key_states.device)
+        key_buffer = self.attn_trace_keys[layer_idx]
+        lengths = self.attn_trace_key_lengths[layer_idx]
+
+        for request_idx in range(key_states.size(0)):
+            for kv_head_idx in range(self.kv_head):
+                group_idx = request_idx * self.kv_head + kv_head_idx
+                if group_idx >= key_buffer.size(0):
+                    continue
+                length = lengths[group_idx]
+                if length >= self.max_length:
+                    raise RuntimeError("Attention trace K buffer is full")
+                key_buffer[group_idx, length].copy_(
+                    key_states[request_idx, 0, kv_head_idx]
+                )
+                lengths[group_idx] = length + 1
+
+    def _trace_attention_weights(self, layer_idx, decode_step, queries):
+        if not self.attn_trace_enabled:
+            return
+        if self.attn_trace_max_steps > 0 and decode_step >= self.attn_trace_max_steps:
+            return
+        if self.attn_trace_layers is not None and layer_idx not in self.attn_trace_layers:
+            return
+
+        if layer_idx not in self.attn_trace_keys:
+            return
+
+        writer = self.attn_trace_writer
+        key_buffer = self.attn_trace_keys[layer_idx]
+        key_lengths = self.attn_trace_key_lengths[layer_idx]
+        max_groups = key_buffer.size(0)
+        queries_by_group = queries.view(
+            self.batch_groups,
+            1,
+            self.group_size,
+            self.head_dim,
+        )
+
+        for batch_group_idx in range(max_groups):
+            valid_len = key_lengths[batch_group_idx]
+            if valid_len <= 0:
+                continue
+
+            head_indices = torch.arange(
+                0,
+                self.group_size,
+                self.attn_trace_head_stride,
+                device=queries.device,
+            )
+            q = queries_by_group[batch_group_idx, 0].index_select(
+                0, head_indices
+            ).float()
+            k = key_buffer[batch_group_idx, :valid_len].float()
+            probs = torch.softmax(
+                torch.matmul(q, k.t()) / math.sqrt(self.head_dim),
+                dim=-1,
+            )
+
+            trace_len = valid_len
+            if self.attn_trace_max_kv_pos > 0:
+                trace_len = min(trace_len, self.attn_trace_max_kv_pos)
+            probs = probs[:, :trace_len]
+
+            bucket_size = self.attn_trace_bucket_size or 1
+            bucket_count = (trace_len + bucket_size - 1) // bucket_size
+            padded_len = bucket_count * bucket_size
+            if padded_len != trace_len:
+                probs = torch.nn.functional.pad(
+                    probs,
+                    (0, padded_len - trace_len),
+                )
+            bucket_weights = probs.reshape(
+                probs.size(0), bucket_count, bucket_size
+            ).sum(dim=-1).detach().cpu()
+
+            topk_indices = None
+            if self.topk_trace_enabled:
+                top_k = min(self.topk_trace_k, trace_len)
+                topk_indices = torch.topk(
+                    probs,
+                    k=top_k,
+                    dim=-1,
+                    largest=True,
+                    sorted=True,
+                ).indices.detach().cpu()
+
+            request_idx = batch_group_idx // self.kv_head
+            kv_head_idx = batch_group_idx % self.kv_head
+            for sampled_head_idx, local_head_idx in enumerate(
+                head_indices.detach().cpu().tolist()
+            ):
+                query_head = kv_head_idx * self.group_size + local_head_idx
+                if self.topk_trace_enabled:
+                    self.topk_trace_writer.writerow({
+                        "run_id": self.trace_run_id,
+                        "trace_session_id": self.attn_trace_session_id,
+                        "task": self.trace_task,
+                        "sample_id": self.trace_sample_id,
+                        "request_idx": request_idx,
+                        "batch_group_idx": batch_group_idx,
+                        "kv_head_group": kv_head_idx,
+                        "layer": layer_idx,
+                        "decode_step": decode_step,
+                        "query_head": query_head,
+                        "top_k": topk_indices.size(1),
+                        # Keep attention-rank order so the plotter can draw a
+                        # smaller top-k without rerunning inference.
+                        "selected_kv_positions": ";".join(
+                            map(str, topk_indices[sampled_head_idx].tolist())
+                        ),
+                        "position_space": "token",
+                        "selection_scope": "full_context_attention_topk",
+                    })
+                for bucket_idx in range(bucket_count):
+                    writer.writerow({
+                        "run_id": self.trace_run_id,
+                        "trace_session_id": self.attn_trace_session_id,
+                        "task": self.trace_task,
+                        "sample_id": self.trace_sample_id,
+                        "request_idx": request_idx,
+                        "batch_group_idx": batch_group_idx,
+                        "kv_head_group": batch_group_idx % self.kv_head,
+                        "layer": layer_idx,
+                        "decode_step": decode_step,
+                        "kv_position": bucket_idx * bucket_size,
+                        "query_head": query_head,
+                        "attention_weight": float(
+                            bucket_weights[sampled_head_idx, bucket_idx]
+                        ),
+                        "kv_bucket_size": bucket_size,
+                        "position_space": "token",
+                        "attention_scope": "full_context",
+                    })
+
     def _trace_finish_layer(self, layer_idx):
-        if self.trace_enabled and layer_idx == self.layer_num - 1:
+        if (self.trace_enabled or self.attn_trace_enabled) and layer_idx == self.layer_num - 1:
             self.trace_step += 1
 
     def _flush_trace_output(self):
@@ -953,6 +1251,20 @@ class retroinfer_cache(KV_Cache):
                 pass
         self.trace_files = {}
         self.trace_writers = {}
+
+    def _close_attention_trace_output(self):
+        for trace_file in (self.attn_trace_file, self.topk_trace_file):
+            if trace_file is None:
+                continue
+            try:
+                trace_file.flush()
+                trace_file.close()
+            except Exception:
+                pass
+        self.attn_trace_file = None
+        self.attn_trace_writer = None
+        self.topk_trace_file = None
+        self.topk_trace_writer = None
     # syko end
 
     # def sparse_attention(self, queries, layer_idx, static_len):
@@ -1248,6 +1560,9 @@ class retroinfer_cache(KV_Cache):
                 cache_seqlens=self.valid_lengths,
                 return_softmax_lse=False,
             )
+
+        if self.attn_trace_enabled:
+            self._trace_attention_weights(layer_idx, trace_decode_step, queries)
 
         # ------------------------------------------------------------
         # 8. Wait for asynchronous LRU/cache-update metadata
