@@ -36,6 +36,13 @@ ext_modules = [
     ),
 ]
 
+# Trace development sometimes changes only the CPU WaveBuffer extension.  Do
+# not force a rebuild of the independent CUDA kernels (and their CUTLASS
+# checkout) in that case.  This is intentionally opt-in so a normal package
+# build remains unchanged.
+if os.environ.get("RETROINFER_BUILD_WAVEBUFFER_ONLY") == "1":
+    ext_modules = ext_modules[:1]
+
 
 setup(
     name='retroinfer_kernels',

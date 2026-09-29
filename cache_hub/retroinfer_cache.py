@@ -110,6 +110,15 @@ class retroinfer_cache(KV_Cache):
             )
         )
 
+        # The compact trace above is sufficient for analyses of RetroInfer's
+        # own cache.  An offline cache-policy replay additionally needs the
+        # *page* identities that WaveBuffer manages, rather than only the
+        # retrieved centroid IDs.  This is deliberately opt-in: serialising
+        # every selected page can make a long decode trace large.
+        self.trace_units_enabled = os.environ.get(
+            "RETRO_TRACE_UNITS", "0"
+        ) == "1"
+
         self.trace_session_id = None
         self.trace_files = {}
         self.trace_writers = {}
@@ -336,12 +345,23 @@ class retroinfer_cache(KV_Cache):
         self.cluster_ids = torch.empty((self.batch_groups, self.nprobe), dtype=torch.int64, pin_memory=True).contiguous()
         # Allocated only for tracing; trace-off performs no residency writes.
         self.selected_cluster_residency = None
+        self.selected_cluster_blocks = None
+        self.selected_cluster_vectors = None
         if self.trace_enabled:
             self.selected_cluster_residency = torch.empty(
                 (self.batch_groups, self.nprobe + self.nprobe_new),
                 dtype=torch.int8,
                 pin_memory=True,
             ).contiguous()
+            if self.trace_units_enabled:
+                self.selected_cluster_blocks = torch.empty(
+                    (self.batch_groups, self.nprobe + self.nprobe_new),
+                    dtype=torch.int32, pin_memory=True,
+                ).contiguous()
+                self.selected_cluster_vectors = torch.empty(
+                    (self.batch_groups, self.nprobe + self.nprobe_new),
+                    dtype=torch.int32, pin_memory=True,
+                ).contiguous()
 
         for ldx in range(self.layer_num):
             self.wave_buffer[ldx].set_indices(
@@ -354,6 +374,11 @@ class retroinfer_cache(KV_Cache):
                 self.wave_buffer[ldx].set_trace_residency(
                     self.selected_cluster_residency
                 )
+                if self.trace_units_enabled:
+                    self.wave_buffer[ldx].set_trace_metadata(
+                        self.selected_cluster_blocks,
+                        self.selected_cluster_vectors,
+                    )
         # syko modified
         if self.trace_enabled:
             self._init_trace_output()
@@ -915,6 +940,15 @@ class retroinfer_cache(KV_Cache):
             "selected_vectors", "hit_vectors", "miss_vectors",
             "selected_bytes", "hit_bytes", "miss_bytes", "byte_hit_ratio",
         ]
+        if self.trace_units_enabled:
+            fields += [
+                # Entries have the same semicolon-delimited order.  IDs are
+                # WaveBuffer page/unit IDs and are unique only within the
+                # (request, layer, KV-head) scope recorded on this row.
+                "selected_unit_ids", "selected_unit_vectors",
+                "selected_unit_residency",
+                "selected_cluster_blocks", "selected_cluster_vectors",
+            ]
         self.trace_files = {"retrieval": trace_file}
         self.trace_writers = {
             "retrieval": csv.DictWriter(trace_file, fieldnames=fields)
@@ -963,7 +997,7 @@ class retroinfer_cache(KV_Cache):
                 else "warming" if decode_step < self.trace_warmup_steps
                 else "steady"
             )
-            writer.writerow({
+            row = {
                 "run_id": self.trace_run_id,
                 "trace_session_id": self.trace_session_id,
                 "task": self.trace_task,
@@ -993,7 +1027,47 @@ class retroinfer_cache(KV_Cache):
                 "byte_hit_ratio": (
                     hit_bytes / selected_bytes if selected_bytes else 0.0
                 ),
-            })
+            }
+            if self.trace_units_enabled:
+                # WaveBuffer exposes the exact units used by the gather
+                # kernel.  They are the authoritative objects for replaying
+                # its page-granular LRU policy.  Keep hits first only because
+                # the source buffers are arranged that way; replay must use
+                # neither this ordering nor the recorded residency.
+                hit_ids = self.hit_unit_idices[layer_idx][
+                    batch_group_idx, :n_hit
+                ].tolist()
+                miss_ids = self.miss_unit_idices[layer_idx][
+                    batch_group_idx, :n_miss
+                ].tolist()
+                hit_sizes = self.hit_unit_sizes[layer_idx][
+                    batch_group_idx, :n_hit
+                ].tolist()
+                miss_sizes = self.miss_unit_sizes[layer_idx][
+                    batch_group_idx, :n_miss
+                ].tolist()
+                unit_ids = hit_ids + miss_ids
+                unit_sizes = hit_sizes + miss_sizes
+                row.update({
+                    "selected_unit_ids": ";".join(map(str, unit_ids)),
+                    "selected_unit_vectors": ";".join(map(str, unit_sizes)),
+                    "selected_unit_residency": ";".join(
+                        ["H"] * n_hit + ["C"] * n_miss
+                    ),
+                    "selected_cluster_blocks": ";".join(map(
+                        str,
+                        self.selected_cluster_blocks[
+                            batch_group_idx, :self.nprobe
+                        ].tolist(),
+                    )),
+                    "selected_cluster_vectors": ";".join(map(
+                        str,
+                        self.selected_cluster_vectors[
+                            batch_group_idx, :self.nprobe
+                        ].tolist(),
+                    )),
+                })
+            writer.writerow(row)
             self.trace_rows += 1
 
         if self.trace_rows >= self.trace_flush_interval:

@@ -294,6 +294,8 @@ private:
     // pointer to the retrieved clusters, [batch_size*group_num, nprobe]
     int64_t* searched_clusters_ptr;         
     int8_t* selected_cluster_residency;     // 1 = HBM cache, 0 = CPU list
+    int* selected_cluster_blocks;           // page count of each selected cluster
+    int* selected_cluster_vectors;          // valid vector count of each selected cluster
 
     // input data to re-organize keys & values based on the clustering results
     // groups = prefill_bsz*group_num when build index during prefilling
@@ -356,6 +358,8 @@ public:
 
         searched_clusters_ptr = nullptr;
         selected_cluster_residency = nullptr;
+        selected_cluster_blocks = nullptr;
+        selected_cluster_vectors = nullptr;
 
         hit_block_ids = nullptr;
         hit_block_sizes = nullptr;
@@ -431,6 +435,8 @@ public:
 
         searched_clusters_ptr = nullptr;
         selected_cluster_residency = nullptr;
+        selected_cluster_blocks = nullptr;
+        selected_cluster_vectors = nullptr;
 
         hit_block_ids = nullptr;
         hit_block_sizes = nullptr;
@@ -497,6 +503,18 @@ public:
     void set_trace_residency(torch::Tensor& selected_cluster_residency_tensor) {
         selected_cluster_residency = static_cast<int8_t*>(
             selected_cluster_residency_tensor.data_ptr<int8_t>()
+        );
+    }
+
+    void set_trace_metadata(
+        torch::Tensor& selected_cluster_blocks_tensor,
+        torch::Tensor& selected_cluster_vectors_tensor
+    ) {
+        selected_cluster_blocks = static_cast<int*>(
+            selected_cluster_blocks_tensor.data_ptr<int32_t>()
+        );
+        selected_cluster_vectors = static_cast<int*>(
+            selected_cluster_vectors_tensor.data_ptr<int32_t>()
         );
     }
 
@@ -738,6 +756,24 @@ public:
             auto miss_block_sizes_cumsum_group = miss_block_sizes_cumsum + i * buffer_size;
             auto residency_group = selected_cluster_residency == nullptr
                 ? nullptr : selected_cluster_residency + i * nprobe;
+            auto block_count_group = selected_cluster_blocks == nullptr
+                ? nullptr : selected_cluster_blocks + i * nprobe;
+            auto vector_count_group = selected_cluster_vectors == nullptr
+                ? nullptr : selected_cluster_vectors + i * nprobe;
+            // The cache's replacement object is a whole cluster, although
+            // capacity is charged in pages.  Export this immutable metadata
+            // so an offline trace replay can reproduce that policy exactly.
+            if (block_count_group != nullptr && vector_count_group != nullptr) {
+                auto descriptors = cluster_descriptors + i * final_n_centroids;
+                for (int j = 0; j < nprobe; ++j) {
+                    const auto& descriptor = descriptors[
+                        searched_clusters_ptr[i * nprobe + j]
+                    ];
+                    block_count_group[j] = descriptor.BlockNum;
+                    vector_count_group[j] = (descriptor.BlockNum - 1) * block_size
+                        + descriptor.LastBlockSize;
+                }
+            }
             // access buffer manager
             auto [hit_num, miss_num, hit_block_num, miss_block_num] = caches[i]->batch_access(searched_clusters_ptr + i * nprobe, nprobe, 
                                                                                               hit_block_ids_group,
@@ -835,7 +871,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("update_buffer_indices"), py::arg("update_block_sizes"), py::arg("update_cache_indices"), py::arg("update_block_nums"), 
             py::arg("searched_clusters"))
         .def("set_trace_residency", &WaveBufferCPU::set_trace_residency,
-            py::arg("selected_cluster_residency"))
+             py::arg("selected_cluster_residency"))
+        .def("set_trace_metadata", &WaveBufferCPU::set_trace_metadata,
+             py::arg("selected_cluster_blocks"), py::arg("selected_cluster_vectors"))
         .def("set_kv", &WaveBufferCPU::set_kv, 
             py::arg("ivf_key"), py::arg("ivf_value"), py::arg("input_keys"), py::arg("input_values"))
         .def("async_construction", &WaveBufferCPU::async_construction, 
